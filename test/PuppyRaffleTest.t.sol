@@ -3,17 +3,20 @@ pragma solidity ^0.7.6;
 pragma experimental ABIEncoderV2;
 
 import {Test, console} from "forge-std/Test.sol";
-import {PuppyRaffle} from "../src/PuppyRaffle.sol";
+import {PuppyRaffle, AttackerContract, SelfDestruct} from "../src/PuppyRaffle.sol";
 
 contract PuppyRaffleTest is Test {
     PuppyRaffle puppyRaffle;
+    AttackerContract attackerContract;
     uint256 entranceFee = 1e18;
     address playerOne = address(1);
     address playerTwo = address(2);
     address playerThree = address(3);
     address playerFour = address(4);
     address feeAddress = address(99);
+    address attacker = makeAddr("attacker");
     uint256 duration = 1 days;
+    uint256 constant INITIAL_ATTACKER_BALANCE = 10 ether;
 
     function setUp() public {
         puppyRaffle = new PuppyRaffle(
@@ -21,6 +24,9 @@ contract PuppyRaffleTest is Test {
             feeAddress,
             duration
         );
+        attackerContract = new AttackerContract(address(puppyRaffle));
+
+        vm.deal(attacker, 10 ether);
     }
 
     //////////////////////
@@ -32,6 +38,37 @@ contract PuppyRaffleTest is Test {
         players[0] = playerOne;
         puppyRaffle.enterRaffle{value: entranceFee}(players);
         assertEq(puppyRaffle.players(0), playerOne);
+    }
+
+    function testEnterRaffleBecomesMoreAndMoreExpensive() public {
+        uint256 numberOfPlayers = 10;
+        address[] memory players = new address[](numberOfPlayers);
+
+        for (uint256 i = 0; i < numberOfPlayers; i++) {
+            players[i] = address(uint160(i + 1));
+        }
+
+        uint256 gasStart = gasleft();
+
+        puppyRaffle.enterRaffle{value: entranceFee * players.length}(players);
+
+        // // 306.189 gas used for 10 players
+        uint256 gasUsedInitial = gasStart - gasleft();
+
+        address[] memory morePlayers = new address[](numberOfPlayers);
+
+        for (uint256 i = 0; i < numberOfPlayers; i++) {
+            morePlayers[i] = address(uint160(i + numberOfPlayers + 1));
+        }
+
+        uint256 gasAfter = gasleft();
+
+        puppyRaffle.enterRaffle{ value: entranceFee * morePlayers.length }(morePlayers);
+
+        // 395.088 gas used for 10 more players
+        uint256 gasAfterUsed = gasAfter - gasleft();
+
+        assert(gasAfterUsed > gasUsedInitial);
     }
 
     function testCantEnterWithoutPaying() public {
@@ -95,6 +132,24 @@ contract PuppyRaffleTest is Test {
         assertEq(address(playerOne).balance, balanceBefore + entranceFee);
     }
 
+    function testRefundReentrancy() public playersEntered {
+        uint256 balanceOfRaffleBeforeAttack = address(puppyRaffle).balance;
+
+        // console.log("Balance of raffle before refund: ", balanceOfRaffleBeforeAttack);
+        vm.prank(address(attackerContract));
+        vm.deal(address(attackerContract), INITIAL_ATTACKER_BALANCE);
+        attackerContract.attack{ value: entranceFee }();
+        
+        uint256 balanceOfRaffleAfterAttack = address(puppyRaffle).balance;
+        uint256 balanceOfAttackerAfterAttack = address(attackerContract).balance;
+
+        // console.log("Balance of raffle after refund: ", balanceOfRaffleAfterAttack);
+        // console.log("Balance of attacker: ", balanceOfAttackerAfterAttack);
+
+        assertEq(balanceOfRaffleAfterAttack, 0);
+        assertEq(balanceOfAttackerAfterAttack, INITIAL_ATTACKER_BALANCE + balanceOfRaffleBeforeAttack);
+    }
+
     function testGettingRefundRemovesThemFromArray() public playerEntered {
         uint256 indexOfPlayer = puppyRaffle.getActivePlayerIndex(playerOne);
 
@@ -124,6 +179,7 @@ contract PuppyRaffleTest is Test {
         assertEq(puppyRaffle.getActivePlayerIndex(playerTwo), 1);
     }
 
+
     //////////////////////
     /// selectWinner         ///
     /////////////////////
@@ -135,6 +191,62 @@ contract PuppyRaffleTest is Test {
         players[3] = playerFour;
         puppyRaffle.enterRaffle{value: entranceFee * 4}(players);
         _;
+    }
+
+
+    function testSelectWinnerOverflow() public playersEntered {
+        // Warp to the end of the raffle
+        vm.warp(block.timestamp + duration + 1);
+        vm.roll(block.number + 1);
+
+        // Select the winner
+        puppyRaffle.selectWinner();
+
+        // 4 players initally, let's check the totalFees -> 800000000000000000 ~ 0.8 ether
+        uint256 initiallyTotalFees = puppyRaffle.totalFees();
+
+        console.log("Initially TotalFees: ", initiallyTotalFees);
+        // Populate more players players so the totalFees overflows
+        uint64 maxUint64 = type(uint64).max; // 18,446,744,073,709,551,615 ~ 18e18
+        uint256 numPlayers = 89;
+        address[] memory players = new address[](numPlayers);
+
+        for (uint256 i = 0; i < numPlayers; i++) {
+            players[i] = address(uint160(i + 1));
+        }
+
+        puppyRaffle.enterRaffle{value: players.length * entranceFee }(players);
+
+        // Warp to the end of the raffle
+        vm.warp(block.timestamp + duration + 1);
+        vm.roll(block.number + 1);
+
+        // Select the winner
+        puppyRaffle.selectWinner();
+
+        vm.expectRevert("PuppyRaffle: There are currently players active!");
+        puppyRaffle.withdrawFees();
+
+        // With 93 players, the totalFees overflows to this number 153255926290448384 which is the difference between actual totalFees and maxUint64, which is not proper
+        uint256 endTotalFees = puppyRaffle.totalFees(); // 0.153.255.926.290.448.384
+
+        console.log("TotalFees end: ", endTotalFees);
+        // Shows off the overflow
+        assert(endTotalFees < initiallyTotalFees);
+    }
+
+
+    function testRandomnessManipulation() public playersEntered {
+        uint256 playersCount = puppyRaffle.getPlayersCount();
+        uint256 expectedWinnerIndex =
+            uint256(keccak256(abi.encodePacked(msg.sender, block.timestamp, block.difficulty))) % playersCount;
+
+        // Change the block timestamp to a known value
+        vm.warp(block.timestamp + 10);
+        uint256 manipulatedWinnerIndex =
+            uint256(keccak256(abi.encodePacked(msg.sender, block.timestamp, block.difficulty))) % playersCount;
+
+        assert(expectedWinnerIndex != manipulatedWinnerIndex);
     }
 
     function testCantSelectWinnerBeforeRaffleEnds() public playersEntered {
@@ -212,5 +324,19 @@ contract PuppyRaffleTest is Test {
         puppyRaffle.selectWinner();
         puppyRaffle.withdrawFees();
         assertEq(address(feeAddress).balance, expectedPrizeAmount);
+    }
+
+    function testWidthdrawFessMisshapen() public playersEntered {
+        vm.warp(block.timestamp + duration + 1);
+        vm.roll(block.number + 1);
+        puppyRaffle.selectWinner();
+
+        SelfDestruct selfDestruct = new SelfDestruct(address(puppyRaffle));
+        // Attack function destructs the `SelfDesctruct` contract and sends entrance fee to the puppyRaffle, which leads to a misshapen balance
+        selfDestruct.attack{ value: entranceFee }();
+
+        vm.prank(feeAddress);
+        vm.expectRevert("PuppyRaffle: There are currently players active!");
+        puppyRaffle.withdrawFees();
     }
 }
